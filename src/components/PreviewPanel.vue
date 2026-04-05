@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { useProjectStore } from '../stores/project'
 import JsonHighlighter from './JsonHighlighter.vue'
 import { simulateRuleChain } from '../utils/simulator'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
 import * as XLSX from 'xlsx'
 
 const store = useProjectStore()
@@ -76,7 +76,7 @@ function clearBatchResults() {
 }
 
 // 导出为 Excel - 横向表格格式（字段作为列，记录作为行）
-function exportToExcel() {
+async function exportToExcel() {
   // 使用批量解析结果或实时模拟结果
   const dataToExport = store.batchResults.length > 0 
     ? store.batchResults 
@@ -87,19 +87,45 @@ function exportToExcel() {
     return
   }
   
+  // 大数据量警告
+  if (dataToExport.length > 50000) {
+    try {
+      await ElMessageBox.confirm(
+        `当前有 ${dataToExport.length.toLocaleString()} 条记录，导出 Excel 可能需要较长时间并占用较多内存。\n\n建议分批导出或使用 JSON 导出」`,
+        '数据量较大',
+        {
+          confirmButtonText: '继续导出',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
+      )
+    } catch {
+      return // 用户取消
+    }
+  }
+  
+  const loading = ElLoading.service({
+    lock: true,
+    text: `正在导出 ${dataToExport.length.toLocaleString()} 条记录...`,
+    background: 'rgba(255, 255, 255, 0.8)',
+  })
+  
   try {
     // 创建工作簿
     const wb = XLSX.utils.book_new()
     
     // 获取所有字段（过滤掉内部字段，如 _raw, _log_number 等）
     const allFields = new Set<string>()
-    dataToExport.forEach((row) => {
+    // 优化：只采样前 1000 条来获取字段，提高性能
+    const sampleSize = Math.min(dataToExport.length, 1000)
+    for (let i = 0; i < sampleSize; i++) {
+      const row = dataToExport[i]
       Object.keys(row).forEach((key) => {
         if (!key.startsWith('_')) {
           allFields.add(key)
         }
       })
-    })
+    }
     
     // 字段排序：按照 formattedFieldsList 的顺序，然后追加其他字段
     const orderedFields: string[] = []
@@ -126,48 +152,52 @@ function exportToExcel() {
     // 添加表头
     excelData.push(orderedFields)
     
-    // 添加数据行
-    dataToExport.forEach((row) => {
-      const rowData: (string | number)[] = []
-      orderedFields.forEach((field) => {
-        let value = row[field]
-        // 如果开启脱敏且字段敏感，则脱敏处理
-        if (store.maskSensitiveData) {
-          const { isSensitive, type } = isSensitiveField(field)
-          if (isSensitive && value !== null && value !== undefined) {
-            value = maskValue(String(value), type)
+    // 添加数据行 - 批次处理避免阻塞
+    const BATCH_EXPORT_SIZE = 5000
+    for (let i = 0; i < dataToExport.length; i += BATCH_EXPORT_SIZE) {
+      const batch = dataToExport.slice(i, i + BATCH_EXPORT_SIZE)
+      
+      batch.forEach((row) => {
+        const rowData: (string | number)[] = []
+        orderedFields.forEach((field) => {
+          let value = row[field]
+          // 如果开启脱敏且字段敏感，则脱敏处理
+          if (store.maskSensitiveData) {
+            const { isSensitive, type } = isSensitiveField(field)
+            if (isSensitive && value !== null && value !== undefined) {
+              value = maskValue(String(value), type)
+            }
           }
-        }
-        // 格式化值
-        let displayValue: string | number = ''
-        if (value === null || value === undefined) {
-          displayValue = ''
-        } else if (typeof value === 'string') {
-          displayValue = value.trim()
-        } else if (typeof value === 'object') {
-          displayValue = JSON.stringify(value)
-        } else if (typeof value === 'number') {
-          displayValue = value
-        } else {
-          displayValue = String(value).trim()
-        }
-        rowData.push(displayValue)
+          // 格式化值
+          let displayValue: string | number = ''
+          if (value === null || value === undefined) {
+            displayValue = ''
+          } else if (typeof value === 'string') {
+            displayValue = value.trim()
+          } else if (typeof value === 'object') {
+            displayValue = JSON.stringify(value)
+          } else if (typeof value === 'number') {
+            displayValue = value
+          } else {
+            displayValue = String(value).trim()
+          }
+          rowData.push(displayValue)
+        })
+        excelData.push(rowData)
       })
-      excelData.push(rowData)
-    })
+      
+      // 每批次处理后让出主线程
+      if (i + BATCH_EXPORT_SIZE < dataToExport.length) {
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+    }
     
     // 创建工作表
     const ws = XLSX.utils.aoa_to_sheet(excelData)
     
-    // 设置列宽（根据字段名长度和内容长度）
-    const colWidths = orderedFields.map((field, idx) => {
-      let maxWidth = field.length + 2
-      dataToExport.forEach((row) => {
-        const value = row[field]
-        const str = String(value ?? '')
-        maxWidth = Math.max(maxWidth, Math.min(str.length + 2, 50))
-      })
-      return { wch: maxWidth }
+    // 设置列宽（只根据字段名长度，避免遍历所有行）
+    const colWidths = orderedFields.map((field) => {
+      return { wch: Math.min(Math.max(field.length + 2, 10), 50) }
     })
     ws['!cols'] = colWidths
     
@@ -208,35 +238,43 @@ function exportToExcel() {
       // 添加表头
       abnormalData.push(orderedFields)
       
-      // 添加异常数据行
-      abnormalRows.forEach((row) => {
-        const rowData: (string | number)[] = []
-        orderedFields.forEach((field) => {
-          let value = row[field]
-          // 如果开启脱敏且字段敏感，则脱敏处理
-          if (store.maskSensitiveData) {
-            const { isSensitive, type } = isSensitiveField(field)
-            if (isSensitive && value !== null && value !== undefined) {
-              value = maskValue(String(value), type)
+      // 添加异常数据行 - 批次处理
+      for (let i = 0; i < abnormalRows.length; i += BATCH_EXPORT_SIZE) {
+        const batch = abnormalRows.slice(i, i + BATCH_EXPORT_SIZE)
+        batch.forEach((row) => {
+          const rowData: (string | number)[] = []
+          orderedFields.forEach((field) => {
+            let value = row[field]
+            // 如果开启脱敏且字段敏感，则脱敏处理
+            if (store.maskSensitiveData) {
+              const { isSensitive, type } = isSensitiveField(field)
+              if (isSensitive && value !== null && value !== undefined) {
+                value = maskValue(String(value), type)
+              }
             }
-          }
-          // 格式化值
-          let displayValue: string | number = ''
-          if (value === null || value === undefined) {
-            displayValue = ''
-          } else if (typeof value === 'string') {
-            displayValue = value.trim()
-          } else if (typeof value === 'object') {
-            displayValue = JSON.stringify(value)
-          } else if (typeof value === 'number') {
-            displayValue = value
-          } else {
-            displayValue = String(value).trim()
-          }
-          rowData.push(displayValue)
+            // 格式化值
+            let displayValue: string | number = ''
+            if (value === null || value === undefined) {
+              displayValue = ''
+            } else if (typeof value === 'string') {
+              displayValue = value.trim()
+            } else if (typeof value === 'object') {
+              displayValue = JSON.stringify(value)
+            } else if (typeof value === 'number') {
+              displayValue = value
+            } else {
+              displayValue = String(value).trim()
+            }
+            rowData.push(displayValue)
+          })
+          abnormalData.push(rowData)
         })
-        abnormalData.push(rowData)
-      })
+        
+        // 每批次处理后让出主线程
+        if (i + BATCH_EXPORT_SIZE < abnormalRows.length) {
+          await new Promise(resolve => setTimeout(resolve, 0))
+        }
+      }
       
       // 创建异常信息工作表
       const abnormalWs = XLSX.utils.aoa_to_sheet(abnormalData)
@@ -255,13 +293,16 @@ function exportToExcel() {
     // 下载文件
     XLSX.writeFile(wb, filename)
     
+    loading.close()
+    
     const msg = abnormalRows.length > 0 
-      ? `已导出 ${dataToExport.length} 条记录，发现 ${abnormalRows.length} 条异常信息` 
-      : `已导出 ${dataToExport.length} 条记录，${orderedFields.length} 个字段到 Excel`
+      ? `已导出 ${dataToExport.length.toLocaleString()} 条记录，发现 ${abnormalRows.length.toLocaleString()} 条异常信息` 
+      : `已导出 ${dataToExport.length.toLocaleString()} 条记录，${orderedFields.length} 个字段到 Excel`
     ElMessage.success(msg)
   } catch (error) {
+    loading.close()
     console.error('Excel 导出失败:', error)
-    ElMessage.error('Excel 导出失败')
+    ElMessage.error('Excel 导出失败: ' + (error instanceof Error ? error.message : '未知错误'))
   }
 }
 

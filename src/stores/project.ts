@@ -84,10 +84,31 @@ export const useProjectStore = defineStore('project', () => {
     return { rules }
   })
 
+  // 大文件阈值（500KB），超过则不保存 rawLog 到 localStorage
+  const LARGE_CONTENT_THRESHOLD = 500 * 1024
+  
   watch(
     project,
     (val) => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(val))
+      try {
+        // 如果 rawLog 太大，则不保存到 localStorage
+        if (val.rawLog && val.rawLog.length > LARGE_CONTENT_THRESHOLD) {
+          // 只保存项目配置，不保存 rawLog
+          const saveData = { ...val, rawLog: '[大文件内容未保存]' }
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(saveData))
+        } else {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(val))
+        }
+      } catch (e) {
+        console.warn('保存到 localStorage 失败:', e)
+        // 如果失败，尝试只保存项目配置（不包含 rawLog）
+        try {
+          const saveData = { ...val, rawLog: '' }
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(saveData))
+        } catch {
+          // 忽略
+        }
+      }
     },
     { deep: true }
   )

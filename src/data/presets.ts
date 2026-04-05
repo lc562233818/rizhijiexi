@@ -1,5 +1,6 @@
 export interface Preset {
   name: string
+  description?: string
   rawLog: string
   rules: Record<string, unknown>[]
 }

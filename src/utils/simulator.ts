@@ -840,3 +840,277 @@ function sanitizeData(data: Record<string, unknown>): Record<string, unknown> {
   })
   return result
 }
+
+// 高性能版本的日志解析 - 用于批量解析，不记录中间步骤
+export function parseLogFast(
+  rawLog: string,
+  rules: OperatorConfig[]
+): Record<string, unknown> | null {
+  if (!rawLog.trim()) return null
+  
+  let currentData: Record<string, unknown> = {
+    raw_message: rawLog,
+    _timestamp: new Date().toISOString(),
+  }
+  
+  for (const rule of rules) {
+    try {
+      currentData = applyOperatorFast(rule, currentData)
+    } catch {
+      // 忽略错误，继续处理下一条规则
+    }
+  }
+  
+  return sanitizeData(currentData)
+}
+
+// 高性能版本的算子执行 - 不记录变化
+function applyOperatorFast(
+  rule: OperatorConfig,
+  data: Record<string, unknown>
+): Record<string, unknown> {
+  const result = { ...data }
+  const params = rule.params
+  
+  switch (rule.name) {
+    case 'grok':
+    case 'regex': {
+      const sourceField = (params.source_field as string) || 'raw_message'
+      const pattern = params.pattern as string
+      const sourceValue = String(data[sourceField] || '')
+      
+      if (!pattern || !sourceValue) return result
+      
+      let regexPattern = pattern
+      
+      // Grok 模式映射
+      const grokPatterns: Record<string, string> = {
+        'IP': '(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})',
+        'IPV6': '([0-9a-fA-F:]+)',
+        'WORD': '(\\w+)',
+        'NUMBER': '([+-]?\\d+(?:\\.\\d+)?)',
+        'INT': '(\\d+)',
+        'DATA': '(.*?)',
+        'GREEDYDATA': '([\\s\\S]*?)',
+        'NOTSPACE': '(\\S+)',
+        'QUOTEDSTRING': '"([^"]*)"',
+        'HTTPDATE': '(\\d{2}/\\w{3}/\\d{4}:\\d{2}:\\d{2}:\\d{2} [+-]\\d{4})',
+        'TIMESTAMP_ISO8601': '(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?[+-]?\\d{2}:?\\d{2})',
+        'URI': '(https?://\\S+)',
+        'URIPATH': '(/[^\\s]*)',
+        'HTTPMETHOD': '(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)',
+        'HTTPVERSION': '(HTTP/\\d\\.\\d)',
+        'LOGLEVEL': '(DEBUG|INFO|WARN|ERROR|FATAL)',
+      }
+      
+      // 处理 Grok 模式
+      const grokRegex = /%\{([A-Z0-9_]+):(\w+)\}/g
+      let match: RegExpExecArray | null
+      while ((match = grokRegex.exec(pattern)) !== null) {
+        const patternName = match[1]
+        const fieldName = match[2]
+        const subPattern = grokPatterns[patternName] || '([^\\s]+)'
+        regexPattern = regexPattern.replace(match[0], `(?<${fieldName}>${subPattern})`)
+      }
+      
+      // 处理简化 Grok 模式
+      const simpleGrokRegex = /%\{([A-Z0-9_]+)\}/g
+      while ((match = simpleGrokRegex.exec(pattern)) !== null) {
+        const patternName = match[1]
+        const subPattern = grokPatterns[patternName] || '([^\\s]+)'
+        regexPattern = regexPattern.replace(match[0], subPattern)
+      }
+      
+      try {
+        const isMultiline = sourceValue.includes('\n') && !regexPattern.includes('\\n')
+        const hasDotAll = regexPattern.includes('GREEDYDATA') || regexPattern.includes('.*')
+        const finalFlags = (isMultiline ? 'm' : '') + (hasDotAll ? 's' : '')
+        
+        const regex = new RegExp(regexPattern, finalFlags)
+        const execResult = regex.exec(sourceValue)
+        
+        if (execResult?.groups) {
+          Object.assign(result, execResult.groups)
+        }
+      } catch {
+        // 忽略正则错误
+      }
+      break
+    }
+    
+    case 'json': {
+      const sourceField = (params.source_field as string) || 'raw_message'
+      try {
+        const parsed = JSON.parse(String(data[sourceField] || ''))
+        const jsonpath = params.jsonpath as Record<string, string> | undefined
+        if (jsonpath) {
+          Object.entries(jsonpath).forEach(([fieldName, path]) => {
+            result[fieldName] = getValueByPath(parsed, path as string)
+          })
+        } else {
+          Object.assign(result, parsed)
+        }
+      } catch {
+        // 忽略 JSON 解析错误
+      }
+      break
+    }
+    
+    case 'csv': {
+      const delimiter = (params.delimiter as string) || ','
+      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
+      const sourceField = (params.source_field as string) || 'raw_message'
+      const values = String(data[sourceField] || '').split(delimiter)
+      fields.forEach((field, index) => {
+        if (values[index] !== undefined) {
+          result[field] = values[index].trim()
+        }
+      })
+      break
+    }
+    
+    case 'timestamp': {
+      const sourceField = params.source_field as string
+      if (sourceField && result[sourceField]) {
+        result['@timestamp'] = result[sourceField]
+      }
+      break
+    }
+    
+    case 'to_number': {
+      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
+      const type = (params.type as string) || 'int'
+      fields.forEach(field => {
+        if (result[field] !== undefined) {
+          const numValue = type === 'int' 
+            ? parseInt(String(result[field]), 10)
+            : parseFloat(String(result[field]))
+          if (!isNaN(numValue)) {
+            result[field] = numValue
+          }
+        }
+      })
+      break
+    }
+    
+    case 'remove': {
+      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
+      fields.forEach(field => {
+        delete result[field]
+      })
+      break
+    }
+    
+    case 'rename': {
+      const mappings = params.mappings as Record<string, string>
+      if (mappings) {
+        Object.entries(mappings).forEach(([oldKey, newKey]) => {
+          if (result[oldKey] !== undefined) {
+            result[newKey] = result[oldKey]
+            delete result[oldKey]
+          }
+        })
+      }
+      break
+    }
+    
+    case 'trim': {
+      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
+      if (fields.length === 0) {
+        Object.keys(result).forEach(key => {
+          if (typeof result[key] === 'string') {
+            result[key] = String(result[key]).trim()
+          }
+        })
+      } else {
+        fields.forEach(field => {
+          if (typeof result[field] === 'string') {
+            result[field] = String(result[field]).trim()
+          }
+        })
+      }
+      break
+    }
+    
+    case 'lowercase':
+    case 'uppercase': {
+      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
+      const transform = rule.name === 'lowercase' 
+        ? (s: string) => s.toLowerCase()
+        : (s: string) => s.toUpperCase()
+      fields.forEach(field => {
+        if (typeof result[field] === 'string') {
+          result[field] = transform(String(result[field]))
+        }
+      })
+      break
+    }
+    
+    case 'ua_parse': {
+      const sourceField = params.source_field as string
+      const ua = String(result[sourceField] || '')
+      if (ua) {
+        let os = 'Unknown', browser = 'Unknown', device = 'Desktop'
+        if (ua.includes('Chrome')) browser = 'Chrome'
+        else if (ua.includes('Firefox')) browser = 'Firefox'
+        else if (ua.includes('Safari')) browser = 'Safari'
+        if (ua.includes('Windows')) os = 'Windows'
+        else if (ua.includes('Mac')) os = 'macOS'
+        else if (ua.includes('Linux')) os = 'Linux'
+        else if (ua.includes('Mobile')) { os = 'Mobile'; device = 'Mobile' }
+        result['os'] = os
+        result['browser'] = browser
+        result['device'] = device
+      }
+      break
+    }
+    
+    case 'geo': {
+      const sourceField = params.source_field as string
+      const targetPrefix = params.target_prefix as string
+      const value = result[sourceField] as string
+      if (value && targetPrefix) {
+        result[`${targetPrefix}country`] = 'Unknown'
+        result[`${targetPrefix}city`] = 'Unknown'
+      }
+      break
+    }
+    
+    case 'format': {
+      const targetField = params.target_field as string
+      const template = params.template as string
+      if (targetField && template) {
+        let formatted = template
+        template.match(/\{(\w+)\}/g)?.forEach((match) => {
+          const key = match.slice(1, -1)
+          formatted = formatted.replace(match, String(result[key] ?? ''))
+        })
+        result[targetField] = formatted
+      }
+      break
+    }
+    
+    case 'url_decode': {
+      const sourceField = params.source_field as string
+      const targetField = (params.target_field as string) || sourceField
+      if (sourceField in result) {
+        try {
+          result[targetField] = decodeURIComponent(String(result[sourceField]))
+        } catch {
+          // 忽略解码错误
+        }
+      }
+      break
+    }
+    
+    case 'add_fields': {
+      const fields = params.fields as Record<string, unknown>
+      if (fields) {
+        Object.assign(result, fields)
+      }
+      break
+    }
+  }
+  
+  return result
+}

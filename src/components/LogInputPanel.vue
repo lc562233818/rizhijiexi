@@ -2,9 +2,10 @@
 import { computed, ref } from 'vue'
 import { useProjectStore } from '../stores/project'
 import { analyzeLogFormat } from '../utils/formatAnalyzer'
-import { simulateRuleChain } from '../utils/simulator'
+import { parseLogFast } from '../utils/simulator'
+import { nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { OperatorConfig } from '../stores/project'
+// import type { OperatorConfig } from '../stores/project'
 
 const store = useProjectStore()
 const analysis = computed(() => analyzeLogFormat(store.project.rawLog))
@@ -27,9 +28,27 @@ const progress = ref({
 })
 
 // 实时预览相关
-const BATCH_SIZE = 100 // 每批处理的日志数量
-const UPDATE_INTERVAL = 50 // 每处理多少条更新一次 UI
+const BATCH_SIZE = 500 // 每批处理的日志数量 (提速：减少UI更新频率)
+const UPDATE_INTERVAL = 100 // 每处理多少条更新一次 UI
 const showLivePreview = ref(true)
+
+// 导入进度相关
+const importProgress = ref({
+  isImporting: false,
+  percentage: 0,
+  loaded: 0,
+  total: 0,
+  mode: 'replace' as 'replace' | 'append' // replace 替换, append 追加
+})
+
+// 导入完成状态
+const importCompleted = ref({
+  show: false,
+  success: false,
+  message: '',
+  lines: 0,
+  fileName: ''
+})
 
 const formatLabelMap: Record<string, string> = {
   json: 'JSON',
@@ -41,17 +60,24 @@ const formatLabelMap: Record<string, string> = {
   plain: '纯文本',
 }
 
-// 触发文件选择
-function triggerFileInput() {
-  fileInput.value?.click()
-}
-
 // 大文件阈值（10MB）
 const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024
 // 大文件预览行数
 const LARGE_FILE_PREVIEW_LINES = 1000
 
-// 处理文件导入 - 支持大文件分块读取
+// 触发文件选择（替换模式）
+function triggerFileInput() {
+  importProgress.value.mode = 'replace'
+  fileInput.value?.click()
+}
+
+// 触发文件选择（追加模式）
+function triggerAppendFileInput() {
+  importProgress.value.mode = 'append'
+  fileInput.value?.click()
+}
+
+// 处理文件导入 - 支持大文件分块读取 + 进度条 + 追加导入
 async function handleFileImport(event: Event) {
   const target = event.target as HTMLInputElement
   const file = target.files?.[0]
@@ -68,7 +94,30 @@ async function handleFileImport(event: Event) {
     return
   }
   
-  isProcessing.value = true
+  // 如果是追加模式且已有内容，询问确认
+  if (importProgress.value.mode === 'append' && store.project.rawLog.length > 0) {
+    const currentLines = store.project.rawLog.split('\n').filter(l => l.trim()).length
+    try {
+      await ElMessageBox.confirm(
+        `当前已有 ${currentLines} 行日志，确定要追加导入 ${formatFileSize(file.size)} 的文件吗？`,
+        '追加导入确认',
+        {
+          confirmButtonText: '确认追加',
+          cancelButtonText: '取消',
+          type: 'info',
+        }
+      )
+    } catch {
+      // 用户取消
+      if (fileInput.value) fileInput.value.value = ''
+      return
+    }
+  }
+  
+  importProgress.value.isImporting = true
+  importProgress.value.percentage = 0
+  importProgress.value.loaded = 0
+  importProgress.value.total = file.size
   
   try {
     let text: string
@@ -92,30 +141,66 @@ async function handleFileImport(event: Event) {
       })
       
       if (shouldReadAll) {
-        // 分批读取大文件
-        text = await readLargeFile(file)
+        // 分批读取大文件（带进度）
+        text = await readLargeFileWithProgress(file)
       } else {
-        // 仅读取前 N 行
-        text = await readFileHeadLines(file, LARGE_FILE_PREVIEW_LINES)
+        // 仅读取前 N 行（带进度）
+        text = await readFileHeadLinesWithProgress(file, LARGE_FILE_PREVIEW_LINES)
       }
     } else {
-      // 小文件直接读取
-      text = await readFileAsText(file)
+      // 小文件直接读取（带进度）
+      text = await readFileAsTextWithProgress(file)
     }
     
-    store.project.rawLog = text
-    ElMessage.success(`已导入文件: ${file.name} (${formatFileSize(file.size)})`)
+    // 根据模式处理：替换或追加
+    const lineCount = text.split('\n').filter(l => l.trim()).length
+    if (importProgress.value.mode === 'append' && store.project.rawLog) {
+      store.project.rawLog = store.project.rawLog + '\n' + text
+      importCompleted.value = {
+        show: true,
+        success: true,
+        message: `已追加导入: ${file.name}`,
+        lines: lineCount,
+        fileName: file.name
+      }
+    } else {
+      store.project.rawLog = text
+      // 清空之前的解析结果
+      parsedResults.value = []
+      store.batchResults = []
+      importCompleted.value = {
+        show: true,
+        success: true,
+        message: `已导入文件: ${file.name}`,
+        lines: lineCount,
+        fileName: file.name
+      }
+    }
     
-    // 清空之前的解析结果
-    parsedResults.value = []
-    store.batchResults = []
+    // 3秒后自动隐藏完成提示
+    setTimeout(() => {
+      importCompleted.value.show = false
+    }, 3000)
+    
+    ElMessage.success(`${importCompleted.value.message} (${formatFileSize(file.size)}, ${lineCount} 行)`)
   } catch (error) {
     if ((error as Error).message !== '用户取消') {
       console.error('文件读取失败:', error)
-      ElMessage.error('文件读取失败: ' + ((error as Error).message || '未知错误'))
+      importCompleted.value = {
+        show: true,
+        success: false,
+        message: '导入失败: ' + ((error as Error).message || '未知错误'),
+        lines: 0,
+        fileName: file.name
+      }
+      ElMessage.error(importCompleted.value.message)
+      setTimeout(() => {
+        importCompleted.value.show = false
+      }, 5000)
     }
   } finally {
-    isProcessing.value = false
+    importProgress.value.isImporting = false
+    importProgress.value.percentage = 0
     // 清空 input 值，允许重复选择同一文件
     if (fileInput.value) {
       fileInput.value.value = ''
@@ -123,43 +208,64 @@ async function handleFileImport(event: Event) {
   }
 }
 
-// 读取文件为文本（小文件）
-function readFileAsText(file: File): Promise<string> {
+// 读取文件为文本（小文件）- 带进度
+function readFileAsTextWithProgress(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
-    reader.onload = (e) => resolve(String(e.target?.result || ''))
-    reader.onerror = (e) => reject(new Error('文件读取失败'))
+    
+    // 进度事件 - 使用 requestAnimationFrame 确保 UI 更新
+    reader.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percentage = Math.round((e.loaded / e.total) * 100)
+        importProgress.value.loaded = e.loaded
+        importProgress.value.percentage = percentage
+        // 强制触发 UI 更新
+        nextTick()
+      }
+    }
+    
+    reader.onload = (e) => {
+      importProgress.value.percentage = 100
+      resolve(String(e.target?.result || ''))
+    }
+    reader.onerror = () => reject(new Error('文件读取失败'))
     reader.readAsText(file)
   })
 }
 
-// 分批读取大文件
-async function readLargeFile(file: File): Promise<string> {
-  const chunkSize = 1024 * 1024 // 1MB 每块
+// 分批读取大文件 - 带进度（优化版）
+async function readLargeFileWithProgress(file: File): Promise<string> {
+  const chunkSize = 2 * 1024 * 1024 // 2MB 每块（增大块大小减少迭代次数）
   const totalChunks = Math.ceil(file.size / chunkSize)
-  let result = ''
+  const chunks: string[] = new Array(totalChunks) // 预分配数组
   
   for (let i = 0; i < totalChunks; i++) {
     const start = i * chunkSize
     const end = Math.min(start + chunkSize, file.size)
     const chunk = file.slice(start, end)
     
-    const text = await readFileAsText(chunk)
-    result += text
+    chunks[i] = await readFileAsText(chunk)
     
-    // 每读取 10MB 让出主线程
-    if (i % 10 === 0) {
-      await new Promise(resolve => setTimeout(resolve, 0))
+    // 更新进度
+    const loaded = Math.min(end, file.size)
+    importProgress.value.loaded = loaded
+    importProgress.value.percentage = Math.round((loaded / file.size) * 100)
+    
+    // 每 5 个块让出一次主线程，并强制 UI 更新
+    if (i % 5 === 0) {
+      await nextTick()
+      await new Promise(resolve => requestAnimationFrame(resolve))
     }
   }
   
-  return result
+  importProgress.value.percentage = 100
+  return chunks.join('')
 }
 
-// 读取文件前 N 行
-async function readFileHeadLines(file: File, maxLines: number): Promise<string> {
-  const chunkSize = 64 * 1024 // 64KB 每块
-  let result = ''
+// 读取文件前 N 行 - 带进度（优化版）
+async function readFileHeadLinesWithProgress(file: File, maxLines: number): Promise<string> {
+  const chunkSize = 256 * 1024 // 256KB 每块（增大块大小）
+  const lines: string[] = []
   let lineCount = 0
   let position = 0
   
@@ -167,21 +273,36 @@ async function readFileHeadLines(file: File, maxLines: number): Promise<string> 
     const chunk = file.slice(position, position + chunkSize)
     const text = await readFileAsText(chunk)
     
-    const lines = text.split('\n')
+    const chunkLines = text.split('\n')
     
-    for (const line of lines) {
+    for (const line of chunkLines) {
       if (lineCount >= maxLines) break
-      result += line + '\n'
+      lines.push(line)
       lineCount++
     }
     
     position += chunkSize
     
-    // 让出主线程
-    await new Promise(resolve => setTimeout(resolve, 0))
+    // 更新进度（每 2 次迭代更新一次）
+    if (position % (chunkSize * 2) === 0 || position >= file.size || lineCount >= maxLines) {
+      importProgress.value.loaded = Math.min(position, file.size)
+      importProgress.value.percentage = Math.round((Math.min(position, file.size) / file.size) * 100)
+      await nextTick()
+    }
   }
   
-  return result
+  importProgress.value.percentage = 100
+  return lines.join('\n')
+}
+
+// 基础读取函数（供内部使用）
+function readFileAsText(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => resolve(String(e.target?.result || ''))
+    reader.onerror = () => reject(new Error('文件读取失败'))
+    reader.readAsText(file)
+  })
 }
 
 // 格式化文件大小
@@ -330,59 +451,75 @@ async function parseMultilineLogs() {
     const rulesWithoutMultiline = store.project.rules.filter(r => r.name !== 'multiline')
     const results: Record<string, unknown>[] = []
     
-    // 阶段2：分批处理日志
+    // 阶段2：分批处理日志 - 使用更大的批次提升性能
     ElMessage.info(`开始解析 ${totalLogs} 条日志...`)
     
-    for (let i = 0; i < totalLogs; i++) {
+    // 优化：一次性处理更大批次，减少UI更新频率
+    const CHUNK_SIZE = Math.min(BATCH_SIZE, Math.max(100, Math.floor(totalLogs / 20)))
+    
+    for (let i = 0; i < totalLogs; i += CHUNK_SIZE) {
       // 检查是否取消
-      if (signal.aborted) {
-        return
-      }
+      if (signal.aborted) return
       
       // 处理暂停
       while (isPaused.value && !signal.aborted) {
         await new Promise(resolve => setTimeout(resolve, 100))
       }
-      
       if (signal.aborted) return
       
-      const log = logsToParse[i]
+      // 处理当前批次
+      const endIdx = Math.min(i + CHUNK_SIZE, totalLogs)
+      let batchSuccess = 0
+      let batchError = 0
       
-      try {
-        const simulationResult = simulateRuleChain(log, rulesWithoutMultiline)
-        
-        if (simulationResult) {
-          const parsedData = {
-            ...simulationResult.finalOutput,
-            _log_number: i + 1,
-            _raw: log,
+      // 使用高性能版本解析，避免记录中间步骤
+      const batchResults: Record<string, unknown>[] = []
+      for (let j = i; j < endIdx; j++) {
+        const log = logsToParse[j]
+        try {
+          const parsed = parseLogFast(log, rulesWithoutMultiline)
+          if (parsed && Object.keys(parsed).length > 1) { // 确保解析到了字段（不只是 raw_message）
+            parsed._log_number = j + 1
+            parsed._raw = log
+            batchResults.push(parsed)
+            batchSuccess++
+          } else {
+            batchError++
           }
-          results.push(parsedData)
-          progress.value.successCount++
-          
-          // 实时更新预览（每 UPDATE_INTERVAL 条更新一次）
-          if (showLivePreview.value && (i + 1) % UPDATE_INTERVAL === 0) {
-            store.batchResults = [...results]
-            await new Promise(resolve => setTimeout(resolve, 0)) // 让出主线程
-          }
+        } catch {
+          batchError++
         }
-      } catch (error) {
-        progress.value.errorCount++
-        console.warn(`解析第 ${i + 1} 条日志失败:`, error)
       }
       
-      // 更新进度（每 BATCH_SIZE 条更新一次进度显示）
-      if ((i + 1) % BATCH_SIZE === 0 || i === totalLogs - 1) {
-        updateProgress(i + 1, totalLogs, progress.value.startTime)
-        
-        // 让出主线程，避免阻塞 UI
-        await new Promise(resolve => setTimeout(resolve, 0))
+      // 批量添加结果（比逐条 push 更高效）
+      if (batchResults.length > 0) {
+        results.push(...batchResults)
       }
+      
+      progress.value.successCount += batchSuccess
+      progress.value.errorCount += batchError
+      
+      // 实时更新预览（降低频率，每5次更新一次）
+      if (showLivePreview.value && (i / CHUNK_SIZE) % 5 === 0) {
+        store.batchResults = results.slice(-1000) // 只保留最近1000条用于预览
+      }
+      
+      // 更新进度（每批次结束后只让出一次主线程）
+      updateProgress(endIdx, totalLogs, progress.value.startTime)
+      await new Promise(resolve => requestAnimationFrame(resolve))
     }
     
-    // 最终结果更新
-    parsedResults.value = results
-    store.batchResults = results
+    // 最终结果更新 - 使用渐进式更新避免卡页面
+    const BATCH_UPDATE_SIZE = 5000
+    parsedResults.value = []
+    store.batchResults = []
+    
+    for (let i = 0; i < results.length; i += BATCH_UPDATE_SIZE) {
+      const batch = results.slice(i, i + BATCH_UPDATE_SIZE)
+      parsedResults.value.push(...batch)
+      store.batchResults = parsedResults.value.slice()
+      await new Promise(resolve => setTimeout(resolve, 10)) // 让出主线程
+    }
     
     const elapsed = (Date.now() - progress.value.startTime) / 1000
     const rate = totalLogs / elapsed
@@ -399,187 +536,6 @@ async function parseMultilineLogs() {
     isPaused.value = false
     abortController = null
   }
-}
-
-// 应用单条规则
-async function applyRule(
-  rule: OperatorConfig,
-  data: Record<string, unknown>,
-  rawLine: string
-): Promise<Record<string, unknown>> {
-  const result = { ...data }
-  const params = rule.params
-  
-  switch (rule.name) {
-    case 'regex':
-    case 'grok': {
-      const pattern = params.pattern as string
-      if (!pattern) return result
-      
-      // 简化版正则应用（实际应该调用 simulator）
-      const regex = new RegExp(pattern)
-      const match = regex.exec(rawLine)
-      if (match && match.groups) {
-        Object.entries(match.groups).forEach(([key, value]) => {
-          if (value !== undefined) {
-            result[key] = value
-          }
-        })
-      }
-      break
-    }
-    
-    case 'json': {
-      try {
-        const parsed = JSON.parse(rawLine)
-        const jsonpath = params.jsonpath as Record<string, string> | undefined
-        if (jsonpath) {
-          Object.entries(jsonpath).forEach(([fieldName, path]) => {
-            result[fieldName] = getValueByPath(parsed, path as string)
-          })
-        } else {
-          Object.assign(result, parsed)
-        }
-      } catch {
-        // JSON 解析失败，保持原数据
-      }
-      break
-    }
-    
-    case 'csv': {
-      const delimiter = (params.delimiter as string) || ','
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      const values = rawLine.split(delimiter)
-      fields.forEach((field, index) => {
-        if (values[index] !== undefined) {
-          result[field] = values[index].trim()
-        }
-      })
-      break
-    }
-    
-    case 'timestamp': {
-      const sourceField = params.source_field as string
-      const value = result[sourceField]
-      if (value) {
-        result['_parsed_timestamp'] = value
-      }
-      break
-    }
-    
-    case 'to_number': {
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      const type = (params.type as string) || 'int'
-      fields.forEach(field => {
-        if (result[field] !== undefined) {
-          const numValue = type === 'int' 
-            ? parseInt(String(result[field]), 10)
-            : parseFloat(String(result[field]))
-          if (!isNaN(numValue)) {
-            result[field] = numValue
-          }
-        }
-      })
-      break
-    }
-    
-    case 'remove': {
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      fields.forEach(field => {
-        delete result[field]
-      })
-      break
-    }
-    
-    case 'trim': {
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      if (fields.length === 0) {
-        Object.keys(result).forEach(key => {
-          if (typeof result[key] === 'string') {
-            result[key] = String(result[key]).trim()
-          }
-        })
-      } else {
-        fields.forEach(field => {
-          if (typeof result[field] === 'string') {
-            result[field] = String(result[field]).trim()
-          }
-        })
-      }
-      break
-    }
-    
-    case 'lowercase': {
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      fields.forEach(field => {
-        if (typeof result[field] === 'string') {
-          result[field] = String(result[field]).toLowerCase()
-        }
-      })
-      break
-    }
-    
-    case 'uppercase': {
-      const fields = (params.fields as string)?.split(',').map(f => f.trim()) || []
-      fields.forEach(field => {
-        if (typeof result[field] === 'string') {
-          result[field] = String(result[field]).toUpperCase()
-        }
-      })
-      break
-    }
-    
-    case 'ua_parse': {
-      const sourceField = params.source_field as string
-      const ua = String(result[sourceField] || '')
-      
-      let os = 'Unknown'
-      let browser = 'Unknown'
-      let device = 'Desktop'
-      
-      if (ua.includes('Windows')) os = 'Windows'
-      else if (ua.includes('Mac')) os = 'macOS'
-      else if (ua.includes('Linux')) os = 'Linux'
-      else if (ua.includes('Android')) { os = 'Android'; device = 'Mobile' }
-      else if (ua.includes('iPhone') || ua.includes('iPad')) { os = 'iOS'; device = 'Mobile' }
-      
-      if (ua.includes('Chrome')) browser = 'Chrome'
-      else if (ua.includes('Safari')) browser = 'Safari'
-      else if (ua.includes('Firefox')) browser = 'Firefox'
-      else if (ua.includes('Edge')) browser = 'Edge'
-      
-      if (ua.includes('Mobile')) device = 'Mobile'
-      
-      result['os'] = os
-      result['browser'] = browser
-      result['device'] = device
-      break
-    }
-    
-    case 'geo': {
-      const prefix = (params.target_prefix as string) || 'geo_'
-      result[`${prefix}country`] = 'CN'
-      result[`${prefix}city`] = 'Beijing'
-      break
-    }
-  }
-  
-  return result
-}
-
-// 根据路径获取对象值
-function getValueByPath(obj: unknown, path: string): unknown {
-  if (!path || !obj) return undefined
-  const cleanPath = path.replace(/^\$\.?/, '').replace(/\['?(\w+)'?\]/g, '.$1')
-  const keys = cleanPath.split('.').filter(Boolean)
-  
-  let result: unknown = obj
-  for (const key of keys) {
-    if (result === null || result === undefined) return undefined
-    if (typeof result !== 'object') return undefined
-    result = (result as Record<string, unknown>)[key]
-  }
-  return result
 }
 
 // 导出解析结果
@@ -668,12 +624,27 @@ function exportAsCsv() {
           @change="handleFileImport"
         />
         
-        <el-tooltip content="导入日志文件">
-          <el-button size="small" :loading="isProcessing" @click="triggerFileInput">
+        <el-dropdown>
+          <el-button size="small" :loading="importProgress.isImporting">
             <el-icon><FolderOpened /></el-icon>
-            导入
+            {{ importProgress.isImporting ? '导入中...' : '导入' }}
           </el-button>
-        </el-tooltip>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item @click="triggerFileInput">
+                <el-icon><Document /></el-icon>
+                替换导入
+              </el-dropdown-item>
+              <el-dropdown-item @click="triggerAppendFileInput" :disabled="!store.project.rawLog">
+                <el-icon><Plus /></el-icon>
+                追加导入
+                <el-tag v-if="store.project.rawLog" size="small" type="info" style="margin-left: 8px;">
+                  {{ store.project.rawLog.split('\n').filter(l => l.trim()).length }} 行
+                </el-tag>
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         
         <el-tooltip content="批量解析多行日志">
           <el-button 
@@ -736,20 +707,71 @@ function exportAsCsv() {
       </div>
     </div>
     
-    <el-input
-      v-model="store.project.rawLog"
-      type="textarea"
-      :rows="10"
-      placeholder="在此粘贴原始日志，或点击【导入】按钮选择日志文件...&#10;支持多行日志，每行将被独立解析"
-      class="log-textarea"
-    />
-    
-    <!-- 解析进度条 -->
-    <div v-if="isProcessing" class="progress-section">
+    <!-- 导入进度条 -->
+    <div v-if="importProgress.isImporting" class="progress-section import-progress">
       <div class="progress-header">
         <span class="progress-title">
-          <el-icon v-if="isPaused" class="paused-icon"><VideoPause /></el-icon>
-          {{ isPaused ? '已暂停' : '正在解析...' }}
+          <el-icon><Upload /></el-icon>
+          {{ importProgress.mode === 'append' ? '正在追加导入...' : '正在导入...' }}
+        </span>
+        <span class="progress-stats">
+          {{ formatFileSize(importProgress.loaded) }} / {{ formatFileSize(importProgress.total) }}
+        </span>
+      </div>
+      <el-progress 
+        :percentage="importProgress.percentage" 
+        :stroke-width="12"
+        status="success"
+      />
+      <div class="progress-details">
+        <span>文件大小: {{ formatFileSize(importProgress.total) }}</span>
+        <span>已读取: {{ formatFileSize(importProgress.loaded) }}</span>
+        <span v-if="importProgress.mode === 'append'">
+          追加模式：将在现有 {{ store.project.rawLog.split('\n').filter(l => l.trim()).length }} 行后添加
+        </span>
+      </div>
+    </div>
+    
+    <!-- 导入完成提示 -->
+    <transition name="fade">
+      <div v-if="importCompleted.show && !importProgress.isImporting" 
+           :class="['import-complete-toast', importCompleted.success ? 'success' : 'error']">
+        <div class="toast-content">
+          <el-icon :size="24" class="toast-icon">
+            <component :is="importCompleted.success ? 'CircleCheck' : 'CircleClose'" />
+          </el-icon>
+          <div class="toast-info">
+            <div class="toast-title">{{ importCompleted.message }}</div>
+            <div v-if="importCompleted.success" class="toast-detail">
+              <el-tag size="small" type="success" effect="plain">
+                {{ importCompleted.lines.toLocaleString() }} 行日志
+              </el-tag>
+              <el-tag size="small" type="info" effect="plain" style="margin-left: 8px;">
+                {{ formatFileSize(importProgress.total) }}
+              </el-tag>
+            </div>
+          </div>
+          <el-button 
+            v-if="importCompleted.success"
+            type="primary" 
+            size="small" 
+            @click="parseMultilineLogs"
+            :disabled="isProcessing"
+          >
+            <el-icon><Connection /></el-icon>
+            立即解析
+          </el-button>
+        </div>
+      </div>
+    </transition>
+    
+    <!-- 解析进度条 -->
+    <div v-if="isProcessing" class="progress-section parsing-progress">
+      <div class="progress-header">
+        <span class="progress-title">
+          <el-icon v-if="isPaused" class="paused-icon" color="#e6a23c"><VideoPause /></el-icon>
+          <el-icon v-else color="#409eff"><Loading /></el-icon>
+          {{ isPaused ? '已暂停' : '正在批量解析...' }}
         </span>
         <span class="progress-stats">
           {{ progress.current }} / {{ progress.total }} 条 ({{ progress.percentage }}%)
@@ -757,19 +779,32 @@ function exportAsCsv() {
       </div>
       <el-progress 
         :percentage="progress.percentage" 
-        :stroke-width="12"
-        :status="isPaused ? 'exception' : ''"
+        :stroke-width="16"
+        :status="isPaused ? 'warning' : undefined"
+        :indeterminate="progress.percentage < 100 && !isPaused"
       />
       <div class="progress-details">
-        <span>成功: {{ progress.successCount }}</span>
-        <span>失败: {{ progress.errorCount }}</span>
-        <span>速度: {{ (progress.current / (progress.elapsedTime / 1000 || 1)).toFixed(0) }} 条/秒</span>
-        <span>已用时: {{ (progress.elapsedTime / 1000).toFixed(1) }}s</span>
+        <el-tag size="small" type="success" effect="plain">
+          <el-icon><Check /></el-icon> 成功: {{ progress.successCount }}
+        </el-tag>
+        <el-tag v-if="progress.errorCount > 0" size="small" type="danger" effect="plain">
+          <el-icon><Close /></el-icon> 失败: {{ progress.errorCount }}
+        </el-tag>
+        <span>速度: <strong>{{ (progress.current / (progress.elapsedTime / 1000 || 1)).toFixed(0) }}</strong> 条/秒</span>
+        <span>已用时: <strong>{{ (progress.elapsedTime / 1000).toFixed(1) }}</strong>s</span>
         <span v-if="progress.estimatedTimeRemaining > 0">
-          预计剩余: {{ progress.estimatedTimeRemaining.toFixed(1) }}s
+          预计剩余: <strong>{{ progress.estimatedTimeRemaining.toFixed(1) }}</strong>s
         </span>
       </div>
     </div>
+    
+    <el-input
+      v-model="store.project.rawLog"
+      type="textarea"
+      :rows="10"
+      placeholder="在此粘贴原始日志，或点击【导入】按钮选择日志文件...&#10;支持多行日志，每行将被独立解析"
+      class="log-textarea"
+    />
     
     <!-- 实时预览开关 -->
     <div v-if="isProcessing" class="live-preview-toggle">
@@ -888,6 +923,26 @@ function exportAsCsv() {
   word-break: break-all;
 }
 
+/* 解析进度条特殊样式 */
+.parsing-progress {
+  background: linear-gradient(135deg, #f0f9ff 0%, #e6f7ff 100%);
+  border: 1px solid #91d5ff;
+}
+
+.parsing-progress .progress-title {
+  color: #1890ff;
+}
+
+/* 导入进度条特殊样式 */
+.import-progress {
+  background: linear-gradient(135deg, #f6ffed 0%, #e6ffdf 100%);
+  border: 1px solid #b7eb8f;
+}
+
+.import-progress .progress-title {
+  color: #52c41a;
+}
+
 /* 进度条样式 */
 .progress-section {
   background: #f5f7fa;
@@ -947,5 +1002,98 @@ function exportAsCsv() {
 .live-preview-toggle {
   margin: 8px 0;
   padding: 0 4px;
+}
+
+/* 导入完成提示条 */
+.import-complete-toast {
+  margin: 12px 0;
+  padding: 16px;
+  border-radius: 12px;
+  animation: slideInDown 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.import-complete-toast.success {
+  background: linear-gradient(135deg, #f6ffed 0%, #e6ffdf 100%);
+  border: 1px solid #b7eb8f;
+}
+
+.import-complete-toast.error {
+  background: linear-gradient(135deg, #fff2f0 0%, #ffccc7 100%);
+  border: 1px solid #ff4d4f;
+}
+
+.toast-content {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.toast-icon {
+  flex-shrink: 0;
+}
+
+.import-complete-toast.success .toast-icon {
+  color: #52c41a;
+  animation: checkmarkPop 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.import-complete-toast.error .toast-icon {
+  color: #ff4d4f;
+}
+
+.toast-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.toast-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #262626;
+}
+
+.toast-detail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* 过渡动画 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: all 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+@keyframes slideInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes checkmarkPop {
+  0% {
+    transform: scale(0) rotate(-45deg);
+  }
+  50% {
+    transform: scale(1.2) rotate(0deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
 }
 </style>

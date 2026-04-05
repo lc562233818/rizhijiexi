@@ -130,7 +130,14 @@ function exportToExcel() {
     dataToExport.forEach((row) => {
       const rowData: (string | number)[] = []
       orderedFields.forEach((field) => {
-        const value = row[field]
+        let value = row[field]
+        // 如果开启脱敏且字段敏感，则脱敏处理
+        if (store.maskSensitiveData) {
+          const { isSensitive, type } = isSensitiveField(field)
+          if (isSensitive && value !== null && value !== undefined) {
+            value = maskValue(String(value), type)
+          }
+        }
         // 格式化值
         let displayValue: string | number = ''
         if (value === null || value === undefined) {
@@ -167,6 +174,80 @@ function exportToExcel() {
     // 添加工作表到工作簿
     XLSX.utils.book_append_sheet(wb, ws, '解析结果')
     
+    // ===== 异常信息分析 =====
+    // 识别异常日志：HTTP 状态码 >= 400、日志级别为 error/fatal/critical、查询时间 > 10秒等
+    const abnormalRows = dataToExport.filter((row) => {
+      // 检查 HTTP 状态码
+      const statusCode = row.status_code || row.status
+      if (typeof statusCode === 'number' && statusCode >= 400) return true
+      if (typeof statusCode === 'string' && parseInt(statusCode) >= 400) return true
+      
+      // 检查日志级别
+      const level = String(row.level || row.severity || '').toLowerCase()
+      if (['error', 'fatal', 'critical', 'exception', 'fail'].includes(level)) return true
+      
+      // 检查查询时间（慢查询）
+      const queryTime = row.query_time || row.duration
+      if (typeof queryTime === 'number' && queryTime > 10) return true
+      if (typeof queryTime === 'string' && parseFloat(queryTime) > 10) return true
+      
+      // 检查是否有错误信息
+      const errorMsg = String(row.error || row.error_msg || row.exception || row.stack_trace || '')
+      if (errorMsg && errorMsg.length > 0 && errorMsg !== 'null' && errorMsg !== 'undefined') return true
+      
+      // 检查 Full_scan / Full_join 标记（MySQL 慢日志）
+      if (row.full_scan === 'Yes' || row.full_join === 'Yes') return true
+      
+      return false
+    })
+    
+    // 如果有异常数据，创建异常信息 Sheet
+    if (abnormalRows.length > 0) {
+      const abnormalData: (string | number)[][] = []
+      
+      // 添加表头
+      abnormalData.push(orderedFields)
+      
+      // 添加异常数据行
+      abnormalRows.forEach((row) => {
+        const rowData: (string | number)[] = []
+        orderedFields.forEach((field) => {
+          let value = row[field]
+          // 如果开启脱敏且字段敏感，则脱敏处理
+          if (store.maskSensitiveData) {
+            const { isSensitive, type } = isSensitiveField(field)
+            if (isSensitive && value !== null && value !== undefined) {
+              value = maskValue(String(value), type)
+            }
+          }
+          // 格式化值
+          let displayValue: string | number = ''
+          if (value === null || value === undefined) {
+            displayValue = ''
+          } else if (typeof value === 'string') {
+            displayValue = value.trim()
+          } else if (typeof value === 'object') {
+            displayValue = JSON.stringify(value)
+          } else if (typeof value === 'number') {
+            displayValue = value
+          } else {
+            displayValue = String(value).trim()
+          }
+          rowData.push(displayValue)
+        })
+        abnormalData.push(rowData)
+      })
+      
+      // 创建异常信息工作表
+      const abnormalWs = XLSX.utils.aoa_to_sheet(abnormalData)
+      
+      // 设置列宽
+      abnormalWs['!cols'] = colWidths
+      
+      // 添加异常信息工作表
+      XLSX.utils.book_append_sheet(wb, abnormalWs, '异常信息')
+    }
+    
     // 生成文件名
     const timestamp = new Date().toISOString().slice(0, 10)
     const filename = `结构化日志_${timestamp}.xlsx`
@@ -174,7 +255,10 @@ function exportToExcel() {
     // 下载文件
     XLSX.writeFile(wb, filename)
     
-    ElMessage.success(`已导出 ${dataToExport.length} 条记录，${orderedFields.length} 个字段到 Excel`)
+    const msg = abnormalRows.length > 0 
+      ? `已导出 ${dataToExport.length} 条记录，发现 ${abnormalRows.length} 条异常信息` 
+      : `已导出 ${dataToExport.length} 条记录，${orderedFields.length} 个字段到 Excel`
+    ElMessage.success(msg)
   } catch (error) {
     console.error('Excel 导出失败:', error)
     ElMessage.error('Excel 导出失败')
@@ -247,7 +331,8 @@ const formattedFieldsList = computed<FormattedField[]>(() => {
   
   const fields: FormattedField[] = Object.entries(finalOutput).map(([name, value]) => {
     const valueType = getValueType(value)
-    const displayValue = formatValueForDisplay(value)
+    // 传入字段名以支持敏感信息脱敏
+    const displayValue = formatValueForDisplay(value, name)
     const isInOriginal = name in originalInput && name !== 'raw_message'
     const isRawMessage = name === 'raw_message'
     
@@ -286,19 +371,88 @@ function getValueType(value: unknown): string {
   return typeof value
 }
 
-function formatValueForDisplay(value: unknown): string {
+// 敏感信息检测和脱敏
+const sensitiveFieldPatterns = [
+  { pattern: /ip|client_ip|src_ip|dst_ip|client_host/i, type: 'ip' },
+  { pattern: /password|passwd|pwd|secret|token|api_key|apikey|credential/i, type: 'password' },
+  { pattern: /email|mail/i, type: 'email' },
+  { pattern: /phone|mobile|tel/i, type: 'phone' },
+  { pattern: /credit|card|cvv|ssn|id_card/i, type: 'card' },
+]
+
+function isSensitiveField(fieldName: string): { isSensitive: boolean; type: string } {
+  for (const { pattern, type } of sensitiveFieldPatterns) {
+    if (pattern.test(fieldName)) {
+      return { isSensitive: true, type }
+    }
+  }
+  return { isSensitive: false, type: '' }
+}
+
+function maskValue(value: string, type: string): string {
+  switch (type) {
+    case 'ip':
+      // IP 脱敏：192.168.1.1 -> 192.168.*.*
+      return value.replace(/(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}/g, '$1.*.*')
+    case 'password':
+      // 密码脱敏：全部替换为 ***
+      return '***'
+    case 'email':
+      // 邮箱脱敏：user@example.com -> u***@example.com
+      return value.replace(/(.{1}).*(@.*)/, '$1***$2')
+    case 'phone':
+      // 手机号脱敏：13812345678 -> 138****5678
+      return value.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')
+    case 'card':
+      // 卡号脱敏：只保留后4位
+      return value.replace(/.*(\d{4})/, '****$1')
+    default:
+      return value
+  }
+}
+
+// 对对象进行敏感信息脱敏处理
+function maskSensitiveDataInObject(obj: Record<string, unknown>): Record<string, unknown> {
+  if (!store.maskSensitiveData || !obj) return obj
+  
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(obj)) {
+    const { isSensitive, type } = isSensitiveField(key)
+    if (isSensitive && typeof value === 'string') {
+      result[key] = maskValue(value, type)
+    } else if (isSensitive && typeof value === 'number') {
+      result[key] = maskValue(String(value), type)
+    } else {
+      result[key] = value
+    }
+  }
+  return result
+}
+
+function formatValueForDisplay(value: unknown, fieldName?: string): string {
+  let displayValue: string
   if (value === null) return 'null'
   if (value === undefined) return 'undefined'
   if (typeof value === 'string') {
-    if (value.length > 100) return value.slice(0, 100) + '...'
-    return value
-  }
-  if (typeof value === 'object') {
+    if (value.length > 100) displayValue = value.slice(0, 100) + '...'
+    else displayValue = value
+  } else if (typeof value === 'object') {
     const json = JSON.stringify(value)
-    if (json.length > 100) return json.slice(0, 100) + '...'
-    return json
+    if (json.length > 100) displayValue = json.slice(0, 100) + '...'
+    else displayValue = json
+  } else {
+    displayValue = String(value)
   }
-  return String(value)
+  
+  // 如果开启脱敏开关且字段名匹配敏感字段，则进行脱敏
+  if (store.maskSensitiveData && fieldName) {
+    const { isSensitive, type } = isSensitiveField(fieldName)
+    if (isSensitive) {
+      return maskValue(displayValue, type)
+    }
+  }
+  
+  return displayValue
 }
 
 function getValueTypeTag(type: string): string {
@@ -315,6 +469,22 @@ function getValueTypeTag(type: string): string {
 }
 
 // 生成字段对比数据
+// 脱敏后的批量解析结果
+const maskedBatchResults = computed(() => {
+  if (!store.maskSensitiveData || !store.batchResults.length) {
+    return store.batchResults
+  }
+  return store.batchResults.map(row => maskSensitiveDataInObject(row))
+})
+
+// 脱敏后的单条模拟结果
+const maskedFinalOutput = computed(() => {
+  if (!store.maskSensitiveData || !simulationResult.value) {
+    return simulationResult.value?.finalOutput
+  }
+  return maskSensitiveDataInObject(simulationResult.value.finalOutput)
+})
+
 const generateCompareData = computed(() => {
   if (!simulationResult.value?.steps.length) return []
   
@@ -455,6 +625,15 @@ const generateCompareData = computed(() => {
               <div class="batch-result-header">
                 <el-tag type="success" size="small">批量解析结果</el-tag>
                 <span class="batch-count">共 {{ store.batchResults.length }} 条记录</span>
+                <el-tooltip content="对 IP、密码等敏感信息进行脱敏显示">
+                  <el-switch
+                    v-model="store.maskSensitiveData"
+                    active-text="脱敏"
+                    inactive-text="明文"
+                    size="small"
+                    style="margin-right: 12px;"
+                  />
+                </el-tooltip>
                 <el-button-group size="small">
                   <el-button @click="exportToExcel" type="primary">
                     <el-icon><Download /></el-icon> 导出 Excel
@@ -467,7 +646,7 @@ const generateCompareData = computed(() => {
                   </el-button>
                 </el-button-group>
               </div>
-              <JsonHighlighter :code="JSON.stringify(store.batchResults, null, 2)" />
+              <JsonHighlighter :code="JSON.stringify(maskedBatchResults, null, 2)" />
             </template>
             <!-- 否则展示单条模拟结果 -->
             <template v-else>
@@ -475,6 +654,14 @@ const generateCompareData = computed(() => {
               <div class="single-result-fields">
                 <div class="field-table-header">
                   <span class="field-count">共 {{ formattedFieldsList.length }} 个字段</span>
+                  <el-tooltip content="对 IP、密码等敏感信息进行脱敏显示">
+                    <el-switch
+                      v-model="store.maskSensitiveData"
+                      active-text="脱敏"
+                      inactive-text="明文"
+                      size="small"
+                    />
+                  </el-tooltip>
                 </div>
                 <el-table
                   :data="formattedFieldsList"
@@ -536,7 +723,7 @@ const generateCompareData = computed(() => {
               <!-- JSON 原始格式 -->
               <div class="json-raw-section">
                 <div class="json-section-title">JSON 原始格式</div>
-                <JsonHighlighter :code="JSON.stringify(simulationResult.finalOutput, null, 2)" />
+                <JsonHighlighter :code="JSON.stringify(maskedFinalOutput, null, 2)" />
               </div>
             </template>
           </div>

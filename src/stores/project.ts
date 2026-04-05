@@ -57,6 +57,9 @@ export const useProjectStore = defineStore('project', () => {
   
   // 批量解析结果
   const batchResults = ref<Record<string, unknown>[]>([])
+  
+  // 敏感信息脱敏开关
+  const maskSensitiveData = ref<boolean>(false)
 
   // 监听主题变化并应用到 document
   watch(theme, (newTheme) => {
@@ -142,6 +145,7 @@ export const useProjectStore = defineStore('project', () => {
     project,
     theme,
     batchResults,
+    maskSensitiveData,
     configOutput,
     reset,
     loadPreset,

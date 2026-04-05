@@ -30,7 +30,3 @@ npm run dev
 # 构建生产版本
 npm run build
 ```
-
-## 许可证
-
-MIT
